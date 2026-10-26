@@ -101,7 +101,7 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     application: "TIMIZA LOAN",
     applicationFeeKes: FEE,
-    paymentsEnabled: false
+    paymentsEnabled: true
   });
 });
 
@@ -119,7 +119,7 @@ app.post("/api/applications", (req, res) => {
     const normalizedPhone = phone.startsWith("0")
       ? "254" + phone.slice(1)
       : phone;
-    const allowedAmounts = [300, 500, 800, 1000, 2000];
+    const allowedAmounts = [1000, 2000, 5000, 10000, 20000];
 
     if (fullName.length < 2)
       return res.status(400).json({ error: "Enter your full name." });
