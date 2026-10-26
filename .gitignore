@@ -1,0 +1,18 @@
+.env
+node_modules/
+data/*.json
+*.log
+
+# Private credentials and local customer records
+.env*
+!.env.example
+data/
+applications.json
+
+# Backups and local test files
+backups/
+*.bak
+*.backup*
+server.js.before_*
+stk-test.js
+node_modules/

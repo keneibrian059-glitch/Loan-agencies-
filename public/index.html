@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#102c25">
+<title>TIMIZA LOAN</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header>
+  <a class="brand" href="/">T<span>TIMIZA LOAN</span></a>
+  <a href="#apply">Apply now ↗</a>
+</header>
+<main>
+<section class="hero">
+  <p class="eyebrow">YOUR NEXT CHAPTER STARTS HERE</p>
+  <h1>Make room for<br><span>what’s next.</span></h1>
+  <p>Tell us what you are working towards. Submit a loan request for review.</p>
+  <a class="button" href="#apply">Start an application →</a>
+  <div class="fee"><small>APPLICATION PROCESSING FEE</small><strong>KSh 50</strong><p>No payment is collected on this website yet.</p></div>
+</section>
+<section id="apply">
+  <h2>Request a loan</h2>
+  <p>Complete the form. Submission does not guarantee approval.</p>
+  <form id="application-form">
+    <label>Full name *
+      <input name="fullName" required maxlength="100" autocomplete="name">
+    </label>
+    <label>M-Pesa phone number *
+      <input name="phone" required type="tel" placeholder="07XXXXXXXX" maxlength="20">
+    </label>
+    <label>Email (optional)
+      <input name="email" type="email" maxlength="160">
+    </label>
+    <label>Requested loan amount *
+      <select name="amount" required>
+        <option value="">Choose amount</option>
+        <option value="1000">KSh 1000</option>
+        <option value="2000">KSh 2000</option>
+        <option value="5000">KSh 5000</option>
+        <option value="10000">KSh 10,000</option>
+        <option value="20000">KSh 20,000</option>
+      </select>
+    </label>
+    <label>Monthly income (KSh) *
+      <input name="monthlyIncome" type="number" min="0" required>
+    </label>
+    <label>Purpose of the loan *
+      <textarea name="purpose" required minlength="5" maxlength="300"></textarea>
+    </label>
+    <label class="consent">
+      <input type="checkbox" name="consent" required>
+      I confirm my information is accurate and agree to its use for reviewing my application.
+    </label>
+    <button id="submit-button" type="submit">Submit loan request →</button>
+    <p id="form-message" role="status"></p>
+  </form>
+</section>
+</main>
+<footer>TIMIZA LOAN · © <span id="year"></span></footer>
+</body>
+</html>
