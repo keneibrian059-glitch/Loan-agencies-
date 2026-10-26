@@ -101,7 +101,7 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     application: "TIMIZA LOAN",
     applicationFeeKes: FEE,
-    paymentsEnabled: true
+    paymentsEnabled: false
   });
 });
 
