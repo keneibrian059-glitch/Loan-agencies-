@@ -6,11 +6,29 @@ const rateLimit = require("express-rate-limit");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT) || 3000;
 const FEE = 50;
+
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL must be configured.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000
+});
+
+pool.on("error", err => {
+  console.error("Unexpected PostgreSQL pool error:", err.message);
+});
 const DATA_DIR = path.join(__dirname, "data");
 const STORE = path.join(DATA_DIR, "applications.json");
 
@@ -81,32 +99,38 @@ function text(value, max = 300) {
     : "";
 }
 
-function saveRecord(record) {
-  const records = JSON.parse(fs.readFileSync(STORE, "utf8"));
-  if (!Array.isArray(records)) throw new Error("Invalid application store");
-
-  records.push(record);
-  const temp = STORE + "." + crypto.randomUUID() + ".tmp";
-
-  fs.writeFileSync(temp, JSON.stringify(records, null, 2), {
-    mode: 0o600,
-    flag: "wx"
-  });
-  fs.renameSync(temp, STORE);
-
-  try { fs.chmodSync(STORE, 0o600); } catch {}
+async function saveRecord(record) {
+  await pool.query(
+    `INSERT INTO loan_applications (reference, record)
+     VALUES ($1, $2::jsonb)`,
+    [record.reference, JSON.stringify(record)]
+  );
 }
 
-app.get("/api/health", (_req, res) => {
-  res.json({
-    ok: true,
-    application: "TIMIZA LOAN",
-    applicationFeeKes: FEE,
-    paymentsEnabled: false
-  });
+app.get("/api/health", async (_req, res) => {
+  res.set("Cache-Control", "no-store");
+
+  try {
+    await pool.query("SELECT 1");
+    return res.status(200).json({
+      ok: true,
+      database: "connected",
+      application: "TIMIZA LOAN",
+      applicationFeeKes: FEE,
+      paymentsEnabled: false
+    });
+  } catch (error) {
+    console.error("Health check database query failed:", error.message);
+    return res.status(503).json({
+      ok: false,
+      database: "unavailable",
+      application: "TIMIZA LOAN",
+      paymentsEnabled: false
+    });
+  }
 });
 
-app.post("/api/applications", (req, res) => {
+app.post("/api/applications", async (req, res) => {
   try {
     const fullName = text(req.body.fullName, 100);
     const rawPhone = text(req.body.phone, 24).replace(/[\s()+-]/g, "");
@@ -146,7 +170,7 @@ app.post("/api/applications", (req, res) => {
     const now = new Date().toISOString();
     const reference = "TL-" + crypto.randomBytes(5).toString("hex").toUpperCase();
 
-    saveRecord({
+    await saveRecord({
       reference,
       fullName,
       phone: normalizedPhone,
@@ -173,198 +197,11 @@ app.post("/api/applications", (req, res) => {
 });
 
 // Deliberately unavailable: never simulate or falsely confirm payment.
-app.post("/api/stk-push", async (req, res) => {
+app.post("/api/stk-push", (_req, res) => {
   res.set("Cache-Control", "no-store");
-
-  if (process.env.PAYMENTS_ENABLED !== "true") {
-    return res.status(503).json({
-      error: "Payment collection is disabled."
-    });
-  }
-
-  const required = [
-    "DARAJA_CONSUMER_KEY",
-    "DARAJA_CONSUMER_SECRET",
-    "DARAJA_BUSINESS_SHORTCODE",
-    "DARAJA_TILL_NUMBER",
-    "DARAJA_PASSKEY",
-    "DARAJA_CALLBACK_URL"
-  ];
-
-  if (required.some(k => !process.env[k]?.trim())) {
-    return res.status(503).json({
-      error: "Daraja production configuration is incomplete."
-    });
-  }
-
-  if (process.env.DARAJA_ENV !== "production") {
-    return res.status(503).json({
-      error: "Production credentials must be selected."
-    });
-  }
-
-  const reference = text(req.body.reference, 80);
-  const phone = text(req.body.phone, 20).replace(/[\s()+-]/g, "");
-  const normalizedPhone = phone.startsWith("0")
-    ? "254" + phone.slice(1)
-    : phone;
-
-  if (!/^TL-[A-F0-9]{10}$/i.test(reference)) {
-    return res.status(400).json({ error: "Invalid application reference." });
-  }
-
-  if (!/^254[71]\d{8}$/.test(normalizedPhone)) {
-    return res.status(400).json({ error: "Enter a valid Kenyan M-Pesa number." });
-  }
-
-  let records;
-  try {
-    records = JSON.parse(fs.readFileSync(STORE, "utf8"));
-    if (!Array.isArray(records)) throw new Error("Invalid store");
-  } catch {
-    return res.status(500).json({ error: "Application records unavailable." });
-  }
-
-  const matches = records.filter(r => r.reference === reference);
-  if (matches.length !== 1) {
-    return res.status(404).json({ error: "Application not found." });
-  }
-
-  const record = matches[0];
-
-  if (record.phone !== normalizedPhone) {
-    return res.status(400).json({
-      error: "Phone number must match the application."
-    });
-  }
-
-  if (record.paymentStatus === "paid") {
-    return res.status(409).json({ error: "This application fee is already paid." });
-  }
-
-  if (record.paymentStatus === "pending") {
-    return res.status(409).json({
-      error: "A payment request is already pending. Do not retry yet."
-    });
-  }
-
-  // Never send an STK request until a durable pending state is saved.
-  record.paymentStatus = "pending";
-  record.paymentAmountKes = 50;
-  record.paymentPhone = normalizedPhone;
-  record.paymentRequestedAt = new Date().toISOString();
-
-  const temp = STORE + "." + crypto.randomUUID() + ".tmp";
-  try {
-    fs.writeFileSync(temp, JSON.stringify(records, null, 2), {
-      mode: 0o600,
-      flag: "wx"
-    });
-    fs.renameSync(temp, STORE);
-    try { fs.chmodSync(STORE, 0o600); } catch {}
-  } catch (e) {
-    try { fs.unlinkSync(temp); } catch {}
-    console.error("Could not save pending payment.");
-    return res.status(500).json({ error: "Could not start payment safely." });
-  }
-
-  try {
-    const base = "https://api.safaricom.co.ke";
-    const credentials = Buffer.from(
-      process.env.DARAJA_CONSUMER_KEY + ":" +
-      process.env.DARAJA_CONSUMER_SECRET
-    ).toString("base64");
-
-    const tokenResponse = await fetch(
-      base + "/oauth/v1/generate?grant_type=client_credentials",
-      { headers: { Authorization: "Basic " + credentials } }
-    );
-
-    const tokenData = await tokenResponse.json().catch(() => ({}));
-    if (!tokenResponse.ok || !tokenData.access_token) {
-      throw new Error("Production OAuth failed");
-    }
-
-    const timestamp = new Date().toISOString()
-      .replace(/[-:TZ.]/g, "").slice(0, 14);
-
-    const shortcode = process.env.DARAJA_BUSINESS_SHORTCODE.trim();
-    const password = Buffer.from(
-      shortcode + process.env.DARAJA_PASSKEY.trim() + timestamp
-    ).toString("base64");
-
-    const stkResponse = await fetch(
-      base + "/mpesa/stkpush/v1/processrequest",
-      {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + tokenData.access_token,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          BusinessShortCode: shortcode,
-          Password: password,
-          Timestamp: timestamp,
-          TransactionType: "CustomerBuyGoodsOnline",
-          Amount: 50,
-          PartyA: normalizedPhone,
-          PartyB: process.env.DARAJA_TILL_NUMBER.trim(),
-          PhoneNumber: normalizedPhone,
-          CallBackURL: process.env.DARAJA_CALLBACK_URL.trim(),
-          AccountReference: reference,
-          TransactionDesc: "Loan application processing fee"
-        })
-      }
-    );
-
-    const data = await stkResponse.json().catch(() => ({}));
-
-    if (!stkResponse.ok || data.ResponseCode !== "0" ||
-        !data.CheckoutRequestID || !data.MerchantRequestID) {
-      // Do not automatically retry: Safaricom may have accepted a request
-      // even if the response was interrupted.
-      console.error("Daraja STK request was not confirmed; reconcile before retrying.");
-      return res.status(502).json({
-        error: "Safaricom did not confirm the request. Check transaction status before retrying."
-      });
-    }
-
-    // Store the Safaricom IDs so a verified callback can match this request.
-    record.checkoutRequestID = data.CheckoutRequestID;
-    record.merchantRequestID = data.MerchantRequestID;
-    record.stkResponseAt = new Date().toISOString();
-
-    const latest = JSON.parse(fs.readFileSync(STORE, "utf8"));
-    const current = latest.find(r => r.reference === reference);
-    if (!current || current.paymentStatus !== "pending") {
-      return res.status(409).json({
-        error: "Payment state changed. Reconcile this request before retrying."
-      });
-    }
-
-    current.checkoutRequestID = data.CheckoutRequestID;
-    current.merchantRequestID = data.MerchantRequestID;
-    current.stkResponseAt = new Date().toISOString();
-
-    const temp2 = STORE + "." + crypto.randomUUID() + ".tmp";
-    fs.writeFileSync(temp2, JSON.stringify(latest, null, 2), {
-      mode: 0o600,
-      flag: "wx"
-    });
-    fs.renameSync(temp2, STORE);
-    try { fs.chmodSync(STORE, 0o600); } catch {}
-
-    return res.status(202).json({
-      ok: true,
-      message: "Safaricom accepted the STK request. Check the phone for a prompt.",
-      reference
-    });
-  } catch (error) {
-    console.error("STK request failed:", error.message);
-    return res.status(502).json({
-      error: "Could not confirm the STK request. Reconcile before retrying."
-    });
-  }
+  return res.status(503).json({
+    error: "M-Pesa collection is disabled until payment verification is implemented."
+  });
 });
 
 // Safeguard: callback acknowledgement only; this does NOT verify or record payments.
@@ -413,7 +250,7 @@ app.post("/admin/login", rateLimit({
   });
 });
 
-app.post("/admin/application-status", requireAdmin, (req, res) => {
+app.post("/admin/application-status", requireAdmin, async (req, res) => {
   const suppliedToken = typeof req.body.csrfToken === "string" ? req.body.csrfToken : "";
   const expectedToken = typeof req.session.adminCsrfToken === "string"
     ? req.session.adminCsrfToken : "";
@@ -446,30 +283,23 @@ app.post("/admin/application-status", requireAdmin, (req, res) => {
   }
 
   try {
-    const records = JSON.parse(fs.readFileSync(STORE, "utf8"));
-    if (!Array.isArray(records)) throw new Error("Invalid application store");
+    const result = await pool.query(
+      `UPDATE loan_applications
+       SET record = record || $2::jsonb
+       WHERE reference = $1
+       RETURNING reference`,
+      [
+        reference,
+        JSON.stringify({
+          applicationStatus,
+          loanDecision,
+          statusUpdatedAt: new Date().toISOString()
+        })
+      ]
+    );
 
-    const matches = records.filter(r => r.reference === reference);
-    if (matches.length !== 1) {
-      return res.status(404).type("text").send("Application not found or reference is not unique.");
-    }
-
-    const record = matches[0];
-    record.applicationStatus = applicationStatus;
-    record.loanDecision = loanDecision;
-    record.statusUpdatedAt = new Date().toISOString();
-
-    const temp = STORE + "." + crypto.randomUUID() + ".tmp";
-    try {
-      fs.writeFileSync(temp, JSON.stringify(records, null, 2), {
-        mode: 0o600,
-        flag: "wx"
-      });
-      fs.renameSync(temp, STORE);
-      try { fs.chmodSync(STORE, 0o600); } catch {}
-    } catch (err) {
-      try { fs.unlinkSync(temp); } catch {}
-      throw err;
+    if (result.rowCount !== 1) {
+      return res.status(404).type("text").send("Application not found.");
     }
 
     return res.redirect(303, "/admin");
@@ -479,20 +309,23 @@ app.post("/admin/application-status", requireAdmin, (req, res) => {
   }
 });
 
-app.get("/admin", requireAdmin, (req, res) => {
+app.get("/admin", requireAdmin, async (req, res) => {
   res.set("Cache-Control", "no-store");
   let records;
   try {
-    records = JSON.parse(fs.readFileSync(STORE, "utf8"));
-    if (!Array.isArray(records)) throw new Error("Invalid store");
-  } catch {
+    const result = await pool.query(
+      "SELECT record FROM loan_applications ORDER BY created_at DESC"
+    );
+    records = result.rows.map(row => row.record);
+  } catch (error) {
+    console.error("Could not read applications from PostgreSQL:", error.message);
     return res.status(500).send("Application records could not be read.");
   }
 
   req.session.adminCsrfToken ||= crypto.randomBytes(32).toString("hex");
   const csrfToken = req.session.adminCsrfToken;
 
-  const rows = records.slice().reverse().map(r => {
+  const rows = records.map(r => {
     const appStatus = String(r.applicationStatus || "received_pending_review");
     const decision = String(r.loanDecision || "not_decided");
     const appOptions = [
