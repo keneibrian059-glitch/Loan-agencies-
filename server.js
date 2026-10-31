@@ -235,7 +235,7 @@ app.post("/api/stk-push", async (req, res) => {
     return res.status(400).json({ error: "Invalid application reference." });
   }
 
-  if (!/^254[71]\\d{8}$/.test(normalizedPhone)) {
+  if (!/^254[71]\d{8}$/.test(normalizedPhone)) {
     return res.status(400).json({
       error: "Enter a valid Kenyan M-Pesa number."
     });
