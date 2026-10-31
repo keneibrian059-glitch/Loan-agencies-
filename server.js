@@ -117,7 +117,7 @@ app.get("/api/health", async (_req, res) => {
       database: "connected",
       application: "TIMIZA LOAN",
       applicationFeeKes: FEE,
-      paymentsEnabled: false
+      paymentsEnabled: process.env.PAYMENTS_ENABLED === "true"
     });
   } catch (error) {
     console.error("Health check database query failed:", error.message);
@@ -125,7 +125,7 @@ app.get("/api/health", async (_req, res) => {
       ok: false,
       database: "unavailable",
       application: "TIMIZA LOAN",
-      paymentsEnabled: false
+      paymentsEnabled: process.env.PAYMENTS_ENABLED === "true"
     });
   }
 });
