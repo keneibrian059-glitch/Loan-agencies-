@@ -196,12 +196,199 @@ app.post("/api/applications", async (req, res) => {
   }
 });
 
-// Deliberately unavailable: never simulate or falsely confirm payment.
-app.post("/api/stk-push", (_req, res) => {
+// Production Daraja STK Push, using PostgreSQL application records.
+app.post("/api/stk-push", async (req, res) => {
   res.set("Cache-Control", "no-store");
-  return res.status(503).json({
-    error: "M-Pesa collection is disabled until payment verification is implemented."
-  });
+
+  if (process.env.PAYMENTS_ENABLED !== "true") {
+    return res.status(503).json({ error: "Payment collection is disabled." });
+  }
+
+  const required = [
+    "DARAJA_CONSUMER_KEY",
+    "DARAJA_CONSUMER_SECRET",
+    "DARAJA_BUSINESS_SHORTCODE",
+    "DARAJA_TILL_NUMBER",
+    "DARAJA_PASSKEY",
+    "DARAJA_CALLBACK_URL"
+  ];
+
+  if (required.some(k => !process.env[k]?.trim())) {
+    return res.status(503).json({
+      error: "Daraja production configuration is incomplete."
+    });
+  }
+
+  if (process.env.DARAJA_ENV !== "production") {
+    return res.status(503).json({
+      error: "Production Daraja environment is required."
+    });
+  }
+
+  const reference = text(req.body.reference, 80);
+  const phone = text(req.body.phone, 24).replace(/[\\s()+-]/g, "");
+  const normalizedPhone = phone.startsWith("0")
+    ? "254" + phone.slice(1)
+    : phone;
+
+  if (!/^TL-[A-F0-9]{10}$/i.test(reference)) {
+    return res.status(400).json({ error: "Invalid application reference." });
+  }
+
+  if (!/^254[71]\\d{8}$/.test(normalizedPhone)) {
+    return res.status(400).json({
+      error: "Enter a valid Kenyan M-Pesa number."
+    });
+  }
+
+  let record;
+
+  try {
+    const result = await pool.query(
+      `SELECT record FROM loan_applications WHERE reference = $1`,
+      [reference]
+    );
+
+    if (result.rowCount !== 1) {
+      return res.status(404).json({ error: "Application not found." });
+    }
+
+    record = result.rows[0].record;
+
+    if (record.phone !== normalizedPhone) {
+      return res.status(400).json({
+        error: "Phone number must match the application."
+      });
+    }
+
+    if (record.paymentStatus === "paid") {
+      return res.status(409).json({
+        error: "This application fee is already paid."
+      });
+    }
+
+    if (record.paymentStatus === "pending") {
+      return res.status(409).json({
+        error: "A payment request is already pending. Do not retry yet."
+      });
+    }
+
+    const updated = await pool.query(
+      `UPDATE loan_applications
+       SET record = record || $2::jsonb
+       WHERE reference = $1
+         AND COALESCE(record->>'paymentStatus', 'not_requested')
+             NOT IN ('pending', 'paid')
+       RETURNING record`,
+      [
+        reference,
+        JSON.stringify({
+          paymentStatus: "pending",
+          paymentAmountKes: FEE,
+          paymentPhone: normalizedPhone,
+          paymentRequestedAt: new Date().toISOString()
+        })
+      ]
+    );
+
+    if (updated.rowCount !== 1) {
+      return res.status(409).json({
+        error: "Payment state changed. Check the application before retrying."
+      });
+    }
+  } catch (error) {
+    console.error("Could not prepare payment:", error.message);
+    return res.status(500).json({
+      error: "Could not prepare payment safely."
+    });
+  }
+
+  try {
+    const base = "https://api.safaricom.co.ke";
+    const credentials = Buffer.from(
+      process.env.DARAJA_CONSUMER_KEY + ":" +
+      process.env.DARAJA_CONSUMER_SECRET
+    ).toString("base64");
+
+    const tokenResponse = await fetch(
+      base + "/oauth/v1/generate?grant_type=client_credentials",
+      { headers: { Authorization: "Basic " + credentials } }
+    );
+
+    const tokenData = await tokenResponse.json().catch(() => ({}));
+
+    if (!tokenResponse.ok || !tokenData.access_token) {
+      throw new Error("Production OAuth failed");
+    }
+
+    const timestamp = new Date().toISOString()
+      .replace(/[-:TZ.]/g, "").slice(0, 14);
+
+    const shortcode = process.env.DARAJA_BUSINESS_SHORTCODE.trim();
+    const password = Buffer.from(
+      shortcode + process.env.DARAJA_PASSKEY.trim() + timestamp
+    ).toString("base64");
+
+    const stkResponse = await fetch(
+      base + "/mpesa/stkpush/v1/processrequest",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + tokenData.access_token,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          BusinessShortCode: shortcode,
+          Password: password,
+          Timestamp: timestamp,
+          TransactionType: "CustomerBuyGoodsOnline",
+          Amount: FEE,
+          PartyA: normalizedPhone,
+          PartyB: process.env.DARAJA_TILL_NUMBER.trim(),
+          PhoneNumber: normalizedPhone,
+          CallBackURL: process.env.DARAJA_CALLBACK_URL.trim(),
+          AccountReference: reference,
+          TransactionDesc: "Loan application processing fee"
+        })
+      }
+    );
+
+    const data = await stkResponse.json().catch(() => ({}));
+
+    if (!stkResponse.ok || String(data.ResponseCode) !== "0" ||
+        !data.CheckoutRequestID || !data.MerchantRequestID) {
+      console.error("Daraja did not confirm STK acceptance. Reconciliation required.");
+      return res.status(502).json({
+        error: "Safaricom did not confirm the STK request. Do not retry until its status is checked."
+      });
+    }
+
+    await pool.query(
+      `UPDATE loan_applications
+       SET record = record || $2::jsonb
+       WHERE reference = $1
+         AND record->>'paymentStatus' = 'pending'`,
+      [
+        reference,
+        JSON.stringify({
+          checkoutRequestID: data.CheckoutRequestID,
+          merchantRequestID: data.MerchantRequestID,
+          stkResponseAt: new Date().toISOString()
+        })
+      ]
+    );
+
+    return res.status(202).json({
+      ok: true,
+      message: "Safaricom accepted the STK request. Check your phone for the KSh 50 prompt.",
+      reference
+    });
+  } catch (error) {
+    console.error("STK request failed:", error.message);
+    return res.status(502).json({
+      error: "STK request could not be confirmed. Check transaction status before retrying."
+    });
+  }
 });
 
 // Safeguard: callback acknowledgement only; this does NOT verify or record payments.
